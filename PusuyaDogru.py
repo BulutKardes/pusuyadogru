@@ -98,11 +98,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# GİZLİ ADMIN ŞİFRESİ (Streamlit Secrets'tan okunur, yoksa 22027 varsayılan alınır)
 ADMIN_PASSKEY = st.secrets.get("ADMIN_KEY", "22027")
 
 # ==============================================================================
-# 2. VERİTABANI YÖNETİMİ (KEY İZOLASYONLU)
+# 2. VERİTABANI YÖNETİMİ & MİGRASYON
 # ==============================================================================
 DB_FILE = "quantum_discoveries.db"
 
@@ -110,7 +109,6 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    # 1. Kullanıcı Erişim Keyleri Tablosu
     c.execute('''
         CREATE TABLE IF NOT EXISTS access_keys (
             access_key TEXT PRIMARY KEY,
@@ -119,35 +117,15 @@ def init_db():
         )
     ''')
 
-    # 2. Tablo yapısı güncellemeleri (Migration)
-    # discoveries tablosunu kontrol et ve güncelle
-    c.execute("PRAGMA table_info(discoveries)")
-    columns = [column[1] for column in c.fetchall()]
-    if columns and "access_key" not in columns:
-        if "device_id" in columns:
-            c.execute("ALTER TABLE discoveries RENAME COLUMN device_id TO access_key")
-        else:
-            c.execute("ALTER TABLE discoveries ADD COLUMN access_key TEXT")
+    for table_name in ["discoveries", "saved_locations", "user_settings"]:
+        c.execute(f"PRAGMA table_info({table_name})")
+        columns = [column[1] for column in c.fetchall()]
+        if columns and "access_key" not in columns:
+            if "device_id" in columns:
+                c.execute(f"ALTER TABLE {table_name} RENAME COLUMN device_id TO access_key")
+            else:
+                c.execute(f"ALTER TABLE {table_name} ADD COLUMN access_key TEXT")
 
-    # saved_locations tablosunu kontrol et ve güncelle
-    c.execute("PRAGMA table_info(saved_locations)")
-    columns = [column[1] for column in c.fetchall()]
-    if columns and "access_key" not in columns:
-        if "device_id" in columns:
-            c.execute("ALTER TABLE saved_locations RENAME COLUMN device_id TO access_key")
-        else:
-            c.execute("ALTER TABLE saved_locations ADD COLUMN access_key TEXT")
-
-    # user_settings tablosunu kontrol et ve güncelle
-    c.execute("PRAGMA table_info(user_settings)")
-    columns = [column[1] for column in c.fetchall()]
-    if columns and "access_key" not in columns:
-        if "device_id" in columns:
-            c.execute("ALTER TABLE user_settings RENAME COLUMN device_id TO access_key")
-        else:
-            c.execute("ALTER TABLE user_settings ADD COLUMN access_key TEXT")
-
-    # 3. Tablolar yoksa sıfırdan oluştur
     c.execute('''
         CREATE TABLE IF NOT EXISTS discoveries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,7 +265,32 @@ def get_groq_key(key):
 init_db()
 
 # ==============================================================================
-# 3. KULLANICI GİRİŞİ & OTURUM KONTROLÜ
+# 3. YÖN VE PUSULA HESAPLAMA YARDIMCILARI
+# ==============================================================================
+def calculate_bearing_and_distance(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    distance = R * c
+
+    y = math.sin(dlon) * math.cos(math.radians(lat2))
+    x = math.cos(math.radians(lat1)) * math.sin(math.radians(lat2)) - math.sin(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.cos(dlon)
+    bearing = math.atan2(y, x)
+    bearing_deg = (math.degrees(bearing) + 360) % 360
+
+    directions = ["Kuzey (N)", "Kuzey-Kuzeydoğu (NNE)", "Kuzeydoğu (NE)", "Doğu-Kuzeydoğu (ENE)",
+                  "Doğu (E)", "Doğu-Güneydoğu (ESE)", "Güneydoğu (SE)", "Güney-Güneydoğu (SSE)",
+                  "Güney (S)", "Güney-Güneybatı (SSW)", "Güneybatı (SW)", "Batı-Güneybatı (WSW)",
+                  "Batı (W)", "Batı-Kuzeybatı (WNW)", "Kuzeybatı (NW)", "Kuzey-Kuzeybatı (NNW)"]
+    index = int((bearing_deg + 11.25) / 22.5) % 16
+    compass_name = directions[index]
+
+    return distance, bearing_deg, compass_name
+
+# ==============================================================================
+# 4. KULLANICI GİRİŞİ & OTURUM KONTROLÜ
 # ==============================================================================
 if "authenticated_key" not in st.session_state:
     st.session_state.authenticated_key = None
@@ -316,7 +319,7 @@ CURRENT_KEY = st.session_state.authenticated_key
 IS_ADMIN = (CURRENT_KEY == ADMIN_PASSKEY)
 
 # ==============================================================================
-# 4. SESSION STATE İLK YÜKLEME
+# 5. SESSION STATE İLK YÜKLEME
 # ==============================================================================
 if "user_lat" not in st.session_state:
     st.session_state.user_lat = 41.2867
@@ -332,9 +335,9 @@ if "groq_key" not in st.session_state:
     st.session_state.groq_key = get_groq_key(CURRENT_KEY)
 
 # ==============================================================================
-# 5. KUANTUM ENTROPİ & AI MOTORU
+# 6. KUANTUM ENTROPİ & YÖNE DUYARLI ANOMALİ MOTORU
 # ==============================================================================
-def get_quantum_random_numbers(count=100):
+def get_quantum_random_numbers(count=150):
     url = f"https://qrng.anu.edu.au/API/jsonI.php?length={count}&type=hex16&size=1"
     try:
         response = requests.get(url, timeout=3)
@@ -347,14 +350,36 @@ def get_quantum_random_numbers(count=100):
         pass
     return np.random.uniform(0, 1, count)
 
-def generate_quantum_point(center_lat, center_lon, radius_km, mode="Attractor"):
-    q_data = get_quantum_random_numbers(150)
+def generate_quantum_point(center_lat, center_lon, radius_km, target_direction="Tümü (Serbest)", mode="Attractor"):
+    q_data = get_quantum_random_numbers(200)
     lat_deg_per_km = 1 / 111.0
     lon_deg_per_km = 1 / (111.0 * math.cos(math.radians(center_lat)))
     
-    u, v, weights = q_data[:50], q_data[50:100], q_data[100:150]
+    u, v, weights = q_data[:60], q_data[60:120], q_data[120:180]
+    
     radii = radius_km * np.sqrt(u)
-    angles = 2 * math.pi * v
+    
+    # Yön filtreleme/odaklama mantığı (Açı aralığı belirleme)
+    direction_map = {
+        "Kuzey (N)": 0.0,
+        "Kuzeydoğu (NE)": 45.0,
+        "Doğu (E)": 90.0,
+        "Güneydoğu (SE)": 135.0,
+        "Güney (S)": 180.0,
+        "Güneybatı (SW)": 225.0,
+        "Batı (W)": 270.0,
+        "Kuzeybatı (NW)": 315.0
+    }
+    
+    if target_direction != "Tümü (Serbest)" and target_direction in direction_map:
+        center_deg = direction_map[target_direction]
+        # Seçilen yönün etrafında ±67.5 derecelik bir dilimde daha fazla odaklanma yarat
+        # Rastgele açıları seçilen merkeze kaydırıp daraltıyoruz
+        angle_offsets = (v * 135.0) - 67.5 # -67.5 ile +67.5 derece arası
+        angles_deg = (center_deg + angle_offsets) % 360
+        angles = np.radians(angles_deg)
+    else:
+        angles = 2 * math.pi * v
     
     dx = radii * np.cos(angles) * lon_deg_per_km
     dy = radii * np.sin(angles) * lat_deg_per_km
@@ -372,7 +397,10 @@ def generate_quantum_point(center_lat, center_lon, radius_km, mode="Attractor"):
         idx = np.random.randint(0, len(lats))
         power = round(float(np.random.uniform(1.5, 6.0)), 2)
         
-    return lats[idx], lons[idx], power
+    final_lat = lats[idx]
+    final_lon = lons[idx]
+    
+    return final_lat, final_lon, power
 
 def analyze_intent_with_groq(api_key, intent, anomaly_type, power, notes=""):
     if not api_key:
@@ -408,7 +436,7 @@ def analyze_intent_with_groq(api_key, intent, anomaly_type, power, notes=""):
         return f"Bağlantı hatası: {str(e)}"
 
 # ==============================================================================
-# 6. ANA ARAYÜZ VE SEKMELER
+# 7. ANA ARAYÜZ VE SEKMELER
 # ==============================================================================
 top_col1, top_col2 = st.columns([8, 2])
 with top_col1:
@@ -425,7 +453,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Sekme Listesi Yapılandırması (Admin modunda Key Ekle sekmesi açılır)
 tabs_list = ["📍 Keşif Haritası", "🤖 AI Niyet Analizi", "📜 Keşif Günlüğü", "⚙️ Ayarlar"]
 if IS_ADMIN:
     tabs_list.append("🔑 Key Üreteci (Admin)")
@@ -453,24 +480,32 @@ with active_tabs[0]:
                 st.toast(f"🎯 '{selected_loc_name}' yüklendi.", icon="✅")
                 st.rerun()
 
-    with st.expander("🎯 Kuantum Parametreleri & Koordinat", expanded=True):
+    with st.expander("🎯 Kuantum Parametreleri & Yön Seçimi", expanded=True):
         st.markdown(f"**Aktif Koordinat:** `{st.session_state.user_lat:.5f}, {st.session_state.user_lon:.5f}`")
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
+        
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
             anomaly_type = st.radio("Anomali Türü:", ["Attractor (Yoğunluk)", "Void (Boşluk)", "Blindspot (Kör Nokta)"], index=0)
-        with col_m2:
             search_radius = st.slider("Arama Yarıçapı (km):", min_value=1.0, max_value=15.0, value=3.0, step=0.5)
+        with col_p2:
+            target_dir = st.selectbox(
+                "🧭 Hedef Yön (Pusula Odaklı):",
+                ["Tümü (Serbest)", "Kuzey (N)", "Kuzeydoğu (NE)", "Doğu (E)", "Güneydoğu (SE)", "Güney (S)", "Güneybatı (SW)", "Batı (W)", "Kuzeybatı (NW)"]
+            )
             user_intent_input = st.text_input("Niyetiniz / Odak Noktanız:", placeholder="Örn: Huzur, Yeni bir işaret...")
 
     if st.button("🌌 KUANTUM ANOMALİSİ ÜRET", use_container_width=True):
-        with st.spinner("Kuantum entropi havuzuna bağlanılıyor..."):
+        with st.spinner("Kuantum entropi ve yön matrisi hesaplanıyor..."):
             mode_clean = anomaly_type.split()[0]
-            lat, lon, power = generate_quantum_point(st.session_state.user_lat, st.session_state.user_lon, search_radius, mode=mode_clean)
+            lat, lon, power = generate_quantum_point(
+                st.session_state.user_lat, st.session_state.user_lon, 
+                search_radius, target_direction=target_dir, mode=mode_clean
+            )
             st.session_state.active_point = {
                 "lat": lat, "lon": lon, "power": power, "type": mode_clean,
-                "intent": user_intent_input if user_intent_input else "Belirtilmedi", "radius": search_radius
+                "intent": user_intent_input if user_intent_input else "Belirtilmedi", "radius": search_radius, "direction": target_dir
             }
-            st.toast("✨ Yeni Kuantum Koordinatı Tespiti Yapıldı!", icon="🎯")
+            st.toast(f"✨ {target_dir} yönünde kuantum koordinatı tespiti yapıldı!", icon="🎯")
 
     st.markdown("<h4 style='color:#00f3ff; margin-top:10px;'>🗺️ Canlı Kuantum Sahası</h4>", unsafe_allow_html=True)
     m = folium.Map(location=[st.session_state.user_lat, st.session_state.user_lon], zoom_start=13, tiles="CartoDB dark_matter")
@@ -478,25 +513,44 @@ with active_tabs[0]:
 
     if st.session_state.active_point:
         apt = st.session_state.active_point
-        folium.Circle(radius=180, location=[apt["lat"], apt["lon"]], color="#00f3ff", fill=True, fill_color="#9d4edd", fill_opacity=0.45).add_to(m)
+        folium.Circle(radius=apt["radius"] * 1000, location=[apt["lat"], apt["lon"]], color="#00f3ff", fill=True, fill_color="#9d4edd", fill_opacity=0.35).add_to(m)
         folium.Marker([apt["lat"], apt["lon"]], popup=f"Güç: {apt['power']} | Tip: {apt['type']}", icon=folium.Icon(color="red", icon="bullseye", prefix="fa")).add_to(m)
 
     st_folium(m, width="100%", height=360, returned_objects=[])
 
     if st.session_state.active_point:
         apt = st.session_state.active_point
+        dist, bearing, compass_dir = calculate_bearing_and_distance(
+            st.session_state.user_lat, st.session_state.user_lon, apt['lat'], apt['lon']
+        )
+
         st.markdown(f"""
         <div class="quantum-card">
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <span style="color: #00f3ff; font-weight: bold; font-size:1.1rem;">⚡ {apt['type'].upper()} ANOMALİSİ</span>
                 <span style="background: rgba(157, 78, 221, 0.3); padding: 4px 12px; border-radius: 20px; font-size: 0.85rem; border: 1px solid #9d4edd; color:#e2e8f0;">Güç: {apt['power']}</span>
             </div>
-            <p style="margin: 10px 0 5px 0; font-size: 0.9rem; color: #cbd5e1;">
-                <b>Hedef Koordinatlar:</b> {apt['lat']:.5f}, {apt['lon']:.5f}<br>
-                <b>Belirlenen Niyet:</b> {apt['intent']}
+            <hr style="border-color: rgba(255,255,255,0.1); margin: 10px 0;">
+            <div style="display: flex; justify-content: space-around; text-align: center; margin-bottom: 10px;">
+                <div>
+                    <small style="color: #94a3b8;">SEÇİLEN YÖN</small>
+                    <div style="color: #ff007f; font-weight: bold; font-size: 0.95rem;">🎯 {apt['direction']}</div>
+                </div>
+                <div>
+                    <small style="color: #94a3b8;">HEDEF YÖN (PUSULA)</small>
+                    <div style="color: #00f3ff; font-weight: bold; font-size: 0.95rem;">🧭 {compass_dir}</div>
+                </div>
+                <div>
+                    <small style="color: #94a3b8;">MESAFE</small>
+                    <div style="color: #10b981; font-weight: bold; font-size: 0.95rem;">{dist:.2f} km ({bearing:.1f}°)</div>
+                </div>
+            </div>
+            <p style="margin: 5px 0 0 0; font-size: 0.85rem; color: #cbd5e1; text-align: center;">
+                <b>Niyet:</b> {apt['intent']}
             </p>
         </div>
         """, unsafe_allow_html=True)
+        
         gmaps_url = f"https://www.google.com/maps/dir/?api=1&origin={st.session_state.user_lat},{st.session_state.user_lon}&destination={apt['lat']},{apt['lon']}"
         st.markdown(f'<a href="{gmaps_url}" target="_blank" style="text-decoration: none;"><button style="background: linear-gradient(90deg, #10b981, #059669); color: white; width: 100%; border-radius: 12px; padding: 12px; border: none; font-weight: bold; margin-bottom: 15px; cursor: pointer;">🧭 Google Maps ile Rotayı Başlat</button></a>', unsafe_allow_html=True)
 
