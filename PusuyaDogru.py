@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 
 # ==============================================================================
@@ -138,7 +139,36 @@ st.markdown(
 )
 
 # ==============================================================================
-# 2. VERİTABANI YÖNETİMİ (SQLite)
+# 2. CİHAZ KİMLİĞİ (DEVICE ID) KÖPRÜSÜ
+# ==============================================================================
+device_id = st.query_params.get("device_id", None)
+
+if not device_id:
+    # Tarayıcının localStorage alanından benzersiz Device ID al / oluştur
+    components.html(
+        """
+        <script>
+        let devId = localStorage.getItem("pusu_device_id");
+        if (!devId) {
+            devId = 'dev_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+            localStorage.setItem("pusu_device_id", devId);
+        }
+        const urlParams = new URLSearchParams(window.top.location.search);
+        if (urlParams.get("device_id") !== devId) {
+            urlParams.set("device_id", devId);
+            window.top.location.search = urlParams.toString();
+        }
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+# Henüz yönlendirme tamamlanmadıysa geçici session_id ataması
+CURRENT_DEVICE_ID = device_id if device_id else "default_device"
+
+# ==============================================================================
+# 3. VERİTABANI YÖNETİMİ (Cihaz İzolasyonlu SQLite)
 # ==============================================================================
 DB_FILE = "quantum_discoveries.db"
 
@@ -146,10 +176,12 @@ DB_FILE = "quantum_discoveries.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Keşifler Tablosu
+
+    # Keşifler Tablosu (device_id eklendi)
     c.execute("""
         CREATE TABLE IF NOT EXISTS discoveries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
             timestamp TEXT,
             lat REAL,
             lon REAL,
@@ -160,84 +192,155 @@ def init_db():
             ai_interpretation TEXT
         )
     """)
-    # Kayıtlı Konumlar Tablosu
+
+    # Kayıtlı Konumlar Tablosu (device_id eklendi)
     c.execute("""
         CREATE TABLE IF NOT EXISTS saved_locations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
+            device_id TEXT,
+            name TEXT,
             lat REAL,
-            lon REAL
+            lon REAL,
+            UNIQUE(device_id, name)
         )
     """)
+
+    # Ayarlar / API Anahtarları Tablosu (device_id özelinde)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            device_id TEXT PRIMARY KEY,
+            groq_key TEXT
+        )
+    """)
+
+    # Eski tablolara kolon ekleme kontrolleri (Geriye Dönük Uyumluluk)
+    try:
+        c.execute("ALTER TABLE discoveries ADD COLUMN device_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE saved_locations ADD COLUMN device_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
 
 def save_discovery(
-    lat, lon, anomaly_type, power, intent, notes, ai_interpretation
+    device_id, lat, lon, anomaly_type, power, intent, notes, ai_interpretation
 ):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     c.execute(
         """
-        INSERT INTO discoveries (timestamp, lat, lon, anomaly_type, power, intent, notes, ai_interpretation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO discoveries (device_id, timestamp, lat, lon, anomaly_type, power, intent, notes, ai_interpretation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
-        (now, lat, lon, anomaly_type, power, intent, notes, ai_interpretation),
+        (
+            device_id,
+            now,
+            lat,
+            lon,
+            anomaly_type,
+            power,
+            intent,
+            notes,
+            ai_interpretation,
+        ),
     )
     conn.commit()
     conn.close()
 
 
-def get_all_discoveries():
+def get_all_discoveries(device_id):
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM discoveries ORDER BY id DESC", conn)
+    df = pd.read_sql_query(
+        "SELECT * FROM discoveries WHERE device_id = ? ORDER BY id DESC",
+        conn,
+        params=(device_id,),
+    )
     conn.close()
     return df
 
 
-def delete_discovery(entry_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM discoveries WHERE id = ?", (entry_id,))
-    conn.commit()
-    conn.close()
-
-
-def save_custom_location(name, lat, lon):
+def delete_discovery(device_id, entry_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "INSERT OR REPLACE INTO saved_locations (name, lat, lon) VALUES (?, ?, ?)",
-        (name, lat, lon),
+        "DELETE FROM discoveries WHERE id = ? AND device_id = ?",
+        (entry_id, device_id),
     )
     conn.commit()
     conn.close()
 
 
-def get_saved_locations():
+def save_custom_location(device_id, name, lat, lon):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT OR REPLACE INTO saved_locations (device_id, name, lat, lon) 
+        VALUES (?, ?, ?, ?)
+    """,
+        (device_id, name, lat, lon),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_saved_locations(device_id):
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query(
-        "SELECT * FROM saved_locations ORDER BY name ASC", conn
+        "SELECT * FROM saved_locations WHERE device_id = ? ORDER BY name ASC",
+        conn,
+        params=(device_id,),
     )
     conn.close()
     return df
 
 
-def delete_saved_location(loc_id):
+def delete_saved_location(device_id, loc_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("DELETE FROM saved_locations WHERE id = ?", (loc_id,))
+    c.execute(
+        "DELETE FROM saved_locations WHERE id = ? AND device_id = ?",
+        (loc_id, device_id),
+    )
     conn.commit()
     conn.close()
+
+
+def save_groq_key(device_id, key):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT OR REPLACE INTO user_settings (device_id, groq_key) VALUES (?, ?)
+    """,
+        (device_id, key),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_groq_key(device_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT groq_key FROM user_settings WHERE device_id = ?", (device_id,)
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else ""
 
 
 # Veritabanını başlat
 init_db()
 
 # ==============================================================================
-# 3. SESSION STATE BAŞLATMA & OTOMATİK DOLDURMA YÖNETİMİ
+# 4. SESSION STATE BAŞLATMA
 # ==============================================================================
 if "user_lat" not in st.session_state:
     st.session_state.user_lat = 41.2867  # Varsayılan: Samsun
@@ -250,11 +353,11 @@ if "input_lon" not in st.session_state:
 if "active_point" not in st.session_state:
     st.session_state.active_point = None
 if "groq_key" not in st.session_state:
-    st.session_state.groq_key = ""
+    st.session_state.groq_key = get_groq_key(CURRENT_DEVICE_ID)
 
 
 # ==============================================================================
-# 4. KUANTUM ENTROPİ & ANOMALİ MOTORU
+# 5. KUANTUM ENTROPİ & ANOMALİ MOTORU
 # ==============================================================================
 def get_quantum_random_numbers(count=100):
     url = f"https://qrng.anu.edu.au/API/jsonI.php?length={count}&type=hex16&size=1"
@@ -311,7 +414,7 @@ def generate_quantum_point(center_lat, center_lon, radius_km, mode="Attractor"):
 
 
 # ==============================================================================
-# 5. GROQ AI SENKRONİSİTE VE NİYET REHBERİ
+# 6. GROQ AI SENKRONİSİTE VE NİYET REHBERİ
 # ==============================================================================
 def analyze_intent_with_groq(api_key, intent, anomaly_type, power, notes=""):
     if not api_key or api_key.startswith("gsk_***"):
@@ -364,7 +467,7 @@ def analyze_intent_with_groq(api_key, intent, anomaly_type, power, notes=""):
 
 
 # ==============================================================================
-# 6. ARAYÜZ (STORY & TABS)
+# 7. ARAYÜZ (STORY & TABS)
 # ==============================================================================
 
 # Hero Header
@@ -391,8 +494,8 @@ tab_map, tab_ai, tab_history, tab_settings = st.tabs([
 # ------------------------------------------------------------------------------
 with tab_map:
 
-    # KAYITLI KONUM SEÇİLDİĞİNDE OTOMATİK DOLDURMA MANTIĞI
-    saved_df = get_saved_locations()
+    # CİHAZA ÖZEL KAYITLI KONUM SEÇİMİ
+    saved_df = get_saved_locations(CURRENT_DEVICE_ID)
     if not saved_df.empty:
         loc_options = {"-- Kayıtlı Konum Seçin (Otomatik Doldur) --": None}
         for _, row in saved_df.iterrows():
@@ -413,7 +516,6 @@ with tab_map:
                 st.session_state.user_lat != target_lat
                 or st.session_state.user_lon != target_lon
             ):
-                # Anında koordinatları otomatik yaz ve session_state güncelle
                 st.session_state.user_lat = target_lat
                 st.session_state.user_lon = target_lon
                 st.session_state.input_lat = target_lat
@@ -614,6 +716,7 @@ with tab_ai:
 
             if st.button("💾 Bu Keşfi Günlüğe Kaydet"):
                 save_discovery(
+                    CURRENT_DEVICE_ID,
                     apt["lat"],
                     apt["lon"],
                     apt["type"],
@@ -622,10 +725,10 @@ with tab_ai:
                     user_notes,
                     st.session_state["last_ai_res"],
                 )
-                st.success("Keşif veritabanına başarıyla kaydedildi!")
+                st.success("Keşif cihazınıza özel olarak kaydedildi!")
 
 # ------------------------------------------------------------------------------
-# TAB 3: KEŞİF GÜNLÜĞÜ
+# TAB 3: KEŞİF GÜNLÜĞÜ (Cihaza Özel)
 # ------------------------------------------------------------------------------
 with tab_history:
     st.markdown(
@@ -633,10 +736,10 @@ with tab_history:
         unsafe_allow_html=True,
     )
 
-    discoveries_df = get_all_discoveries()
+    discoveries_df = get_all_discoveries(CURRENT_DEVICE_ID)
 
     if discoveries_df.empty:
-        st.info("Henüz kaydedilmiş bir keşif bulunmuyor.")
+        st.info("Bu cihazda henüz kaydedilmiş bir keşif bulunmuyor.")
     else:
         for idx, row in discoveries_df.iterrows():
             with st.container():
@@ -665,7 +768,7 @@ with tab_history:
                     if st.button(
                         f"🗑️ Kaydı Sil #{row['id']}", key=f"del_{row['id']}"
                     ):
-                        delete_discovery(row["id"])
+                        delete_discovery(CURRENT_DEVICE_ID, row["id"])
                         st.rerun()
 
 # ------------------------------------------------------------------------------
@@ -678,19 +781,20 @@ with tab_settings:
     )
 
     with st.container():
+        # CİHAZA ÖZEL GROQ API KEY
         groq_input = st.text_input(
-            "Groq API Key (Llama3 Entegrasyonu):",
+            "Groq API Key (Bu cihaz için kaydedilir):",
             value=st.session_state.groq_key,
             type="password",
         )
         if groq_input != st.session_state.groq_key:
             st.session_state.groq_key = groq_input
-            st.success("API Key güncellendi.")
+            save_groq_key(CURRENT_DEVICE_ID, groq_input)
+            st.success("API Key bu cihaz için kaydedildi!")
 
         st.divider()
 
-        # MANUEL KOORDİNAT GİRİŞ KUTULARI (KAYITLI SEÇİLİNCE OTOMATİK DOLAR)
-        st.subheader("📍 Başlangıç Koordinatları (Manuel Düzenle / Kontrol)")
+        st.subheader("📍 Başlangıç Koordinatları")
         c1, c2 = st.columns(2)
         with c1:
             new_lat = st.number_input(
@@ -707,37 +811,37 @@ with tab_settings:
                 key="num_lon_input",
             )
 
-        if st.button("📍 Yeni Koordinatları Aktif Yap"):
+        if st.button("📍 Koordinatları Aktif Yap"):
             st.session_state.user_lat = new_lat
             st.session_state.user_lon = new_lon
             st.session_state.input_lat = new_lat
             st.session_state.input_lon = new_lon
-            st.success("Aktif konum manuel olarak güncellendi!")
+            st.success("Konum güncellendi!")
 
         st.markdown("---")
 
-        # Yeni Konum Kaydetme Formu
-        st.subheader("⭐ Bulunulan / Girilen Koordinatları Kaydet")
+        # CİHAZA ÖZEL KONUM KAYDETME
+        st.subheader("⭐ Bu Cihaza Konum Kaydet")
         loc_name_input = st.text_input(
             "Konum Etiketi / İsmi:",
-            placeholder="Örn: Ev, Sahil Kafe, Merkez Park...",
+            placeholder="Örn: Ev, Sahil Kafe, İş Yeri...",
         )
-        if st.button("💾 Bu Koordinatları İsimle Kaydet"):
+        if st.button("💾 Konumu Bu Cihaza Kaydet"):
             if loc_name_input.strip():
                 save_custom_location(
-                    loc_name_input.strip(), new_lat, new_lon
+                    CURRENT_DEVICE_ID, loc_name_input.strip(), new_lat, new_lon
                 )
                 st.success(
-                    f"'{loc_name_input}' konum listenize eklendi ve kaydedildi!"
+                    f"'{loc_name_input}' cihazınıza özel olarak kaydedildi!"
                 )
                 st.rerun()
             else:
-                st.warning("Lütfen konum için bir isim girin.")
+                st.warning("Lütfen bir isim girin.")
 
-        # Kayıtlı Konumları Silme Yönetimi
-        saved_df_manage = get_saved_locations()
+        # CİHAZA ÖZEL KAYITLI KONUM SİLME
+        saved_df_manage = get_saved_locations(CURRENT_DEVICE_ID)
         if not saved_df_manage.empty:
-            st.subheader("🗑️ Kayıtlı Konumları Sil")
+            st.subheader("🗑️ Bu Cihazdaki Kayıtlı Konumları Yönet")
             for idx, r in saved_df_manage.iterrows():
                 col_loc1, col_loc2 = st.columns([3, 1])
                 with col_loc1:
@@ -747,5 +851,5 @@ with tab_settings:
                     )
                 with col_loc2:
                     if st.button("Sil", key=f"del_loc_{r['id']}"):
-                        delete_saved_location(r["id"])
+                        delete_saved_location(CURRENT_DEVICE_ID, r["id"])
                         st.rerun()
